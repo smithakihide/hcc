@@ -24,8 +24,6 @@ parser.add_argument("-g", '--gui_trace',
 ROI_HELP = "ROI_POINTs can be specified with line numbers, start times, or search strings." +\
             " Supported options include @LINENUM, ^START_TIME, MATCH_NUM%%SEARCH_RE.  Examples: @1234, ^45679.0123, 2%%MyMarker (finds 2nd instance of MyMarker)";
 
-
-
 parser.add_argument('-r', '--roi_start', 
         action="store", 
         help=("Specify start point to use for Region-of-Interest. ROI is inclusive of the start point." + ROI_HELP));
@@ -33,6 +31,28 @@ parser.add_argument('-r', '--roi_start',
 parser.add_argument('-R', '--roi_stop', 
         action="store", 
         help="Specify stop point to use for Region-of-Interest.  ROI is exclusive of the stop point. See roi_start for ROI_STOP format. ")
+
+parser.add_argument('-s', '--summary_filter',
+        action="store", type=argparse.FileType('r'), 
+        help="Specify a filter file to summarize.  Each line in the filter is a tag followed by ':' and regular expressions separated by ';'. For example: 'mytag: mykernel0 ; mykernelns::.*;'.  Output is a single-line summary with the kernels matching the regular expressions aggregated into the associated tag")
+
+parser.add_argument('--resources',
+        help="Specify list of resources to show.  Can be regular expression.  Examples: 'GPU0', 'GPU[01]', 'DATA'")
+
+parser.add_argument('--summary',
+        action='store_true', 
+        help="Show topN hotspot commands on each resource")
+
+parser.add_argument('--filter_db',
+        action='store_true', 
+        help="Debug filters - show which commands are captured in each filter")
+
+
+parser.add_argument('-q', '--quiet',
+        action='store_true', 
+        help="Suppress informatioal messages")
+
+
 
 parser.add_argument('--info', 
         action="store_true",
@@ -100,6 +120,12 @@ def processArgs():
             parser.print_help()
             exit()
     args = parser.parse_args(myargs)
+
+
+    # always do something:
+    if not args.summary_filter and not args.text_trace and not args.gui_trace:
+        args.summary = True;
+
 
     args.gaps.sort()
 
@@ -184,14 +210,14 @@ class ProfileLogRecord:
                 # older traces did not have enq time, so set to start time here.
                 self.startTime =  (int)(fields[3])
                 self.stopTime  =  (int)(fields[4])
-                self.enqTime   = self.startTime-10
+                self.enqTime   = self.startTime
                 fi = 5
 
 
             try:
                 (self.device, self.queue, self.cmdNum) = [int(f) for f in fields[fi].lstrip("#").split(".")]
             except:
-                print "warning: unknown opid tag=", fields[fi]
+                print "warning: line:", lineNum, " unknown opid tag=", fields[fi]
                 self.device = 0
 
 
@@ -283,6 +309,8 @@ class ProfileLogRecord:
             except ValueError:
                 None
 
+
+
     def printMe(self, timeOffset=0, showText=False):
         if showText and not args.hide_app_text and self.text != None:
             #print "@%d-@%d" % (self.text.startLineNum, self.text.stopLineNum)
@@ -308,20 +336,19 @@ class ProfileLogRecord:
             time = 0
         else:
             time = self.criticalTime
+        if (self.cmdNum != None):
+            print     "%4s %16.6f: %+10.2f %-7s" % \
+                    (Resource.getName(self), \
+                     (self.startTime - timeOffset) / 1000000.0, time/1000.0, \
+                     self.type),
 
-        print     "%4s %16.6f: %+10.2f %-7s #%d.%d.%d %8d: %-30s" % \
-                (Resource.getName(self), \
-                 (self.startTime - timeOffset) / 1000000.0, time/1000.0, \
-                 self.type, 
-                 self.device, self.queue, self.cmdNum, 
-                 self.lineNum, self.name),
+            if (self.cmdNum != None):
+                try:
+                    print "#%d.%d.%d" % (self.device, self.queue, self.cmdNum),
+                except: # TODO - remove t
+                    print "#cmd?%s.%s.%s" % (self.device, self.queue, self.cmdNum),
 
-        #if (self.cmdNum != None):
-        #    try:
-        #        print "#%d.%d.%d" % (self.device, self.queue, self.cmdNum),
-        #    except: # TODO - remove t
-        #        #print "#?%s.%s.%s" % (self.device, self.queue, self.cmdNum),
-
+            print     "%8d: %-30s" % (self.lineNum, self.name),
 
 	# TODO - figure out if this is useful.
         #if (args.text_trace_verbose):
@@ -373,10 +400,10 @@ class ProfileSummaryRecord:
         self.maxTime = 0
 
 
-    def setFields(self, type, criticalTime, startTime, stopTime):
+    def setFields(self, type, refs, criticalTime, startTime, stopTime):
 
         self.type = type
-        self.refs  += 1
+        self.refs  += refs
         self.totalCriticalTime += criticalTime
 
         if (self.minTime == None) or (criticalTime < self.minTime):
@@ -389,9 +416,13 @@ class ProfileSummaryRecord:
         if (stopTime > self.lastRefTime):
             self.lastRefTime = stopTime
 
+    def combineRecord(self, sr):
+        """ Combine fields from another ProfileSummarRecord.  Used for filters"""
+        self.setFields(sr.type, sr.refs, sr.totalCriticalTime, sr.firstRefTime, sr.lastRefTime);
+
 
     def addRecord(self, summaryDict, logRec):
-        self.setFields(logRec.type, logRec.criticalTime, logRec.startTime, logRec.stopTime)
+        self.setFields(logRec.type, 1, logRec.criticalTime, logRec.startTime, logRec.stopTime)
 
         gapName = logRec.gapName();
 
@@ -400,7 +431,11 @@ class ProfileSummaryRecord:
 
 
     def addGapRecord(self, logRec):
-        self.setFields("gap", logRec.gapFromPrev, logRec.startTime-logRec.gapFromPrev, logRec.startTime)
+        self.setFields("gap", 1, logRec.gapFromPrev, logRec.startTime-logRec.gapFromPrev, logRec.startTime)
+
+
+    def percentString(self, totalTime):
+        return "%.2f%%" % (self.totalCriticalTime*100.0)
 
 
     @staticmethod
@@ -410,6 +445,7 @@ class ProfileSummaryRecord:
 
 
     def printMe(self, totalTimeNs):
+        
         if args.no_gaps and  self.type == "gap":
             None
         else:
@@ -417,8 +453,10 @@ class ProfileSummaryRecord:
 
             print "%13.2f%% %10.1f %8d %8.1f %8.1f %8.1f  %-30s" %\
                   (self.totalCriticalTime*100.0/totalTimeNs, timeUs,
-                   self.refs,
-                   timeUs/self.refs,  self.minTime/1000.0, self.maxTime/1000.0, self.name)
+                   self.refs, timeUs/self.refs, 
+                   self.minTime/1000.0, self.maxTime/1000.0, self.name)
+
+
 
 
 """
@@ -460,11 +498,16 @@ class Resource:
     def selectMaxTime(self, roiTime):
         # Users may have different interpretations of the gap
         if args.no_gaps:
-            return self.busyTime;
+            time =  self.busyTime;
         #elif args.trim_gaps:
         #    return self.lastLogRecord.stopTime - self.firstLogRecord.startTime
         else :
-            return roiTime
+            time = roiTime
+
+        if time==0:
+            time = 1
+
+        return time
 
 
     def addLogRecord(self, lr, roiStartTime):
@@ -486,6 +529,52 @@ class Resource:
         self.opsPerQueue.setdefault(lr.queue, 0)
         self.opsPerQueue[lr.queue] += 1
 
+
+    def generateFilterData(self, filterDefs):
+        # After records have been summarized, filter the summaries into an even higher-order summary
+
+        # Create empty summary records for the filter categories:
+        self.summaryByFilter = []
+        for f in filterDefs:
+            self.summaryByFilter.append(FilterData(f))
+
+        for sr in self.summaryByName.itervalues():
+            matched = False
+            for fsr in self.summaryByFilter:
+                if not fsr.filter.isDefaultFilter or not matched:
+                    matched |= fsr.filterAndCombine(sr)
+
+    def printFilterHeader(self):
+        print "%8s" % ("Filters"),
+        for frs in self.summaryByFilter:
+            print "\t%11s" % (frs.filter.tag),
+        print
+
+    def printFilterData(self, roiTime, oneLine):
+
+        self.printFilterHeader()
+
+        time = self.selectMaxTime(roiTime)
+
+        if oneLine:
+            print "%8s" % (self.name),
+            for frs in self.summaryByFilter:
+                print "\t%10.2f%%" % (frs.summary.totalCriticalTime*100.0/time) ,
+
+            sortByTime = sorted(self.summaryByName.iteritems(), key=lambda x: x[1].totalCriticalTime, reverse=True)
+            maxToPrint=3
+            for k in sortByTime:
+                print "\t%s:%6.2f%%" % (k[1].name, k[1].totalCriticalTime*100.0/time),
+                maxToPrint -= 1
+                if (maxToPrint==0):
+                    break
+
+            print 
+        else:
+            print "Resource=%s Filters" % (self.name)
+            for frs in self.summaryByFilter:
+                if frs.summary.refs:
+                    frs.summary.printMe(time)
 
     def printSummary(self, roiTime):
 
@@ -518,10 +607,61 @@ class Resource:
 
 
 
+""" Filters combine records from multiple summary records that match the specified regular expression """
+# Filter class exists in a array at the file-parser level
+class Filter:
+    def __init__(self, tag, filters):
+        self.tag = tag.strip()
+        if filters == None:
+            self.isDefaultFilter = True
+            self.filters=[]
+        else:
+            self.filters   = [f.strip() for f in filters.split(";")]
+            self.filtersRE = [re.compile(f) for f in self.filters]
+            self.isDefaultFilter = False
+            #print "Filter ", self.tag, "filters=", self.filters
+
+
+
+
+
+""" Data """
+class FilterData:
+    def __init__(self, filter):
+        self.filter = filter
+        self.summary = ProfileSummaryRecord(filter.tag)
+
+    def filterAndCombine(self, sr):
+        """ if the summary record matches one of the filters, combine it"""
+        if self.filter.isDefaultFilter:
+            if args.filter_db:
+                print "summary records '%s' summary records matched filter %s time=%d" % (sr.name, self.filter.tag, self.totalCriticalTime) 
+            self.summary.combineRecord(sr)
+            return True
+        else:
+            for fre in self.filter.filtersRE:
+                if fre.search(sr.name):
+                    #if args.filter_db:
+                    #    print sr.name, "matched filter", self.filter.tag, " / " , self.filter.filters
+                    self.summary.combineRecord(sr)
+                    return True;
+            return False
+
+
+
+
+
 class FileParser:
+
     def __init__(self, file):
         # Parsing pass - extract profile lines from file, parse, and add to profileLogRecords array
         self.profileLogRecords = []
+
+        self.filters = []
+
+        self.parseFilterFile(args.summary_filter)
+
+
 
         lineNum = 0
         text = None
@@ -561,16 +701,26 @@ class FileParser:
         self.roiStop  = self.profileLogRecords[self.roiStopIndex]
 
         if show:
-            print "ROI_START:",
-            self.roiStart.printMe(self.roiStart.startTime)
-            print "ROI_STOP :" ,
-            self.roiStop.printMe(self.roiStart.startTime)  # yes, this should be startTime
-            print "ROI_TIME=%8.3f secs" % ((self.roiStop.stopTime - self.roiStart.startTime)/1000000000.0)
+            if not args.quiet:
+                print "ROI_START:",
+                self.roiStart.printMe(self.roiStart.startTime)
+                print "ROI_STOP :" ,
+                self.roiStop.printMe(self.roiStart.startTime)  # yes, this should be startTime
+                print "ROI_TIME=%8.3f secs" % ((self.roiStop.stopTime - self.roiStart.startTime)/1000000000.0)
 
         assert (self.roiStartIndex <= self.roiStopIndex)
         assert (self.roiStartIndex >=0 and self.roiStartIndex<len(self.profileLogRecords))
         assert (self.roiStopIndex >=0 and self.roiStopIndex<len(self.profileLogRecords))
 
+
+    def parseFilterFile(self, filterFile):
+        regex = re.compile("(^.*?):(.*)")
+
+        if filterFile != None:
+            for line in filterFile:
+                m = regex.search(line)
+                self.filters.append(Filter(m.group(1), m.group(2)))
+            self.filters.append(Filter("Other", None))
 
 
     def generateResources(self):
@@ -581,6 +731,9 @@ class FileParser:
 
             self.resources.setdefault(resourceName, Resource(resourceName))
             self.resources[resourceName].addLogRecord(lr, self.roiStart.startTime)
+
+        for r in self.resources.itervalues():
+            r.generateFilterData(self.filters)
 
 
     def generateJSON(self, file):
@@ -643,7 +796,8 @@ class FileParser:
                         if lineNum != None:
                             leadingNumbers -= 1
                             if leadingNumbers <= 0:
-                                print "info: %%roi regular expression matched @%d '%s'" %(lineNum, line.rstrip())
+                                if not args.quiet:
+                                    print "info: %%roi regular expression matched @%d '%s'" %(lineNum, line.rstrip())
                                 return (lri, lineNum) 
 
                 raise Exception ("roi search string not found=", roiStr)
@@ -652,10 +806,26 @@ class FileParser:
                 raise Exception ("Invalid roi expression=", roiArg)
 
 
+    def showResource(self, resourceName):
+        if args.resources:
+            if re.search(args.resources, resourceName):
+                return True
+            else:
+                # user specified --resources but resource not found
+                return False
+        else:
+            return True
+
+
     def printSummary(self):
+        roiTime = self.roiStop.stopTime-self.roiStart.startTime
         for r in self.resources:
-            print
-            self.resources[r].printSummary(self.roiStop.stopTime-self.roiStart.startTime)
+            if self.showResource(r):
+                if args.summary:
+                    print
+                    self.resources[r].printSummary(roiTime)
+                if args.summary_filter:
+                    self.resources[r].printFilterData(roiTime, True)
 
             
 def main():
@@ -670,6 +840,7 @@ def main():
         p.generateJSON(args.gui_trace)
 
     p.printSummary()
+
 
 
 args = processArgs();
